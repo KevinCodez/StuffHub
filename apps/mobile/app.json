@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "StuffHub",
+    "slug": "stuffhub",
+    "scheme": "stuffhub",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow StuffHub to photograph rooms and document your belongings."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow StuffHub to attach receipt photos from your library.",
+          "cameraPermission": "Allow StuffHub to photograph receipts."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow StuffHub to view photos you choose.",
+          "savePhotosPermission": "Allow StuffHub to save downloaded and cropped images."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.stuffhub.mobile"
+    },
+    "android": {
+      "package": "app.stuffhub.mobile"
+    }
+  }
+}
