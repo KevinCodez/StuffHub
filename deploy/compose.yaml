@@ -1,69 +1,136 @@
 name: stuffhub
 
+# A complete StuffHub installation. Copy this file to a server and run:
+#   docker compose up -d --wait
+#
+# The first run creates installation-specific credentials in a private Docker
+# volume. No .env file or setup script is required. Environment variables can
+# still override the defaults when integrating a reverse proxy or SMTP server.
+
 services:
+  bootstrap:
+    image: node:22-alpine
+    restart: "no"
+    user: "0:0"
+    command:
+      - node
+      - -e
+      - |
+        const crypto = require("node:crypto");
+        const fs = require("node:fs");
+        const file = "/run/stuffhub/secrets.env";
+        const databaseMarker = "/run/stuffhub-database/PG_VERSION";
+        if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+          console.log("Using the existing StuffHub installation secrets.");
+          process.exit(0);
+        }
+        if (fs.existsSync(databaseMarker)) {
+          console.error("Refusing to generate new secrets because an existing StuffHub database was detected.");
+          console.error("Restore the stuffhub_secrets-data volume from backup, then start the stack again.");
+          process.exit(1);
+        }
+        const encode = (value) => Buffer.from(value).toString("base64url");
+        const jwt = (role, secret) => {
+          const now = Math.floor(Date.now() / 1000);
+          const header = encode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+          const payload = encode(JSON.stringify({ role, iss: "supabase", iat: now, exp: now + 315360000 }));
+          const unsigned = header + "." + payload;
+          const signature = crypto.createHmac("sha256", secret).update(unsigned).digest("base64url");
+          return unsigned + "." + signature;
+        };
+        const password = crypto.randomBytes(32).toString("hex");
+        const secret = crypto.randomBytes(32).toString("hex");
+        const contents = [
+          "POSTGRES_PASSWORD=" + password,
+          "JWT_SECRET=" + secret,
+          "ANON_KEY=" + jwt("anon", secret),
+          "SERVICE_ROLE_KEY=" + jwt("service_role", secret),
+        ].join("\n") + "\n";
+        fs.writeFileSync(file + ".tmp", contents, { mode: 0o644 });
+        fs.renameSync(file + ".tmp", file);
+        console.log("Created unique StuffHub installation secrets.");
+    volumes:
+      - secrets-data:/run/stuffhub
+      - database-data:/run/stuffhub-database:ro
+
   web:
-    image: ${STUFFHUB_IMAGE:?Set STUFFHUB_IMAGE in .env}
+    image: ${STUFFHUB_IMAGE_ROOT:-ghcr.io/kevincodez/stuffhub}:${STUFFHUB_VERSION:-latest}
     restart: unless-stopped
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
       gateway:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["node", "apps/web/server.js"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     environment:
       NODE_ENV: production
       APP_URL: ${APP_URL:-http://localhost:3000}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       SUPABASE_URL: http://gateway:8000
-      SUPABASE_ANON_KEY: ${ANON_KEY:?ANON_KEY is required}
       PASSWORD_RESET_REDIRECT_URL: ${APP_URL:-http://localhost:3000}/?recovery=1
       TESSERACT_LANG_PATH: /app/apps/web
     ports:
       - "${STUFFHUB_PORT:-3000}:3000"
+    volumes:
+      - secrets-data:/run/stuffhub:ro
     healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 20s
 
   migrate:
-    image: postgres:17.6-alpine
+    image: ${STUFFHUB_IMAGE_ROOT:-ghcr.io/kevincodez/stuffhub}-migrate:${STUFFHUB_VERSION:-latest}
     restart: "no"
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       storage:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["/usr/local/bin/stuffhub-migrate"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     environment:
       PGHOST: db
       PGPORT: 5432
       PGDATABASE: postgres
       PGUSER: postgres
-      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
-      - ./migrate.sh:/usr/local/bin/stuffhub-migrate:ro
-      - ./migrations:/migrations:ro
-    entrypoint: ["/bin/sh", "/usr/local/bin/stuffhub-migrate"]
+      - secrets-data:/run/stuffhub:ro
 
   gateway:
-    image: kong/kong:3.9.1
+    image: ${STUFFHUB_IMAGE_ROOT:-ghcr.io/kevincodez/stuffhub}-gateway:${STUFFHUB_VERSION:-latest}
     restart: unless-stopped
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       auth:
         condition: service_healthy
       rest:
         condition: service_healthy
       storage:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["/home/kong/kong-entrypoint.sh"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     ports:
       - "${SUPABASE_PORT:-8000}:8000"
-    volumes:
-      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro
-      - ./volumes/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
@@ -72,11 +139,10 @@ services:
       KONG_PLUGINS: request-transformer,cors,key-auth,acl,post-function
       KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
       KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-      SUPABASE_ANON_KEY: ${ANON_KEY:?ANON_KEY is required}
-      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY:?SERVICE_ROLE_KEY is required}
       SUPABASE_PUBLISHABLE_KEY: ""
       SUPABASE_SECRET_KEY: ""
-    entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
+    volumes:
+      - secrets-data:/run/stuffhub:ro
     healthcheck:
       test: ["CMD", "kong", "health"]
       interval: 5s
@@ -87,8 +153,16 @@ services:
     image: supabase/gotrue:v2.189.0
     restart: unless-stopped
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["/usr/local/bin/auth"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9999/health"]
       interval: 5s
@@ -99,7 +173,6 @@ services:
       GOTRUE_API_PORT: 9999
       API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}/auth/v1
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
       GOTRUE_SITE_URL: ${APP_URL:-http://localhost:3000}
       GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS:-}
       GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
@@ -107,7 +180,6 @@ services:
       GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
-      GOTRUE_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       GOTRUE_JWT_ISSUER: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}/auth/v1
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
       GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
@@ -122,40 +194,57 @@ services:
       GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
       GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
       GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+    volumes:
+      - secrets-data:/run/stuffhub:ro
 
   rest:
     image: postgrest/postgrest:v14.12
     restart: unless-stopped
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["/usr/bin/postgrest"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     healthcheck:
       test: ["CMD", "postgrest", "--ready"]
       interval: 5s
       timeout: 5s
       retries: 10
     environment:
-      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
       PGRST_DB_SCHEMAS: public,storage
       PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
       PGRST_DB_ANON_ROLE: anon
       PGRST_ADMIN_SERVER_PORT: 3001
       PGRST_ADMIN_SERVER_HOST: 127.0.0.1
-      PGRST_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       PGRST_DB_USE_LEGACY_GUCS: "false"
-      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+    volumes:
+      - secrets-data:/run/stuffhub:ro
 
   storage:
     image: supabase/storage-api:v1.60.4
     restart: unless-stopped
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       rest:
         condition: service_healthy
       imgproxy:
         condition: service_healthy
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
+    command: ["docker-entrypoint.sh", "node", "dist/start/server.js"]
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
       interval: 5s
@@ -163,11 +252,7 @@ services:
       retries: 10
       start_period: 10s
     environment:
-      ANON_KEY: ${ANON_KEY:?ANON_KEY is required}
-      SERVICE_KEY: ${SERVICE_ROLE_KEY:?SERVICE_ROLE_KEY is required}
       POSTGREST_URL: http://rest:3000
-      AUTH_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
       STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
       REQUEST_ALLOW_X_FORWARDED_PATH: "true"
       FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
@@ -179,6 +264,7 @@ services:
       ENABLE_IMAGE_TRANSFORMATION: "true"
       IMGPROXY_URL: http://imgproxy:5001
     volumes:
+      - secrets-data:/run/stuffhub:ro
       - storage-data:/var/lib/storage
 
   imgproxy:
@@ -199,28 +285,32 @@ services:
       - storage-data:/var/lib/storage
 
   db:
-    image: supabase/postgres:17.6.1.136
+    image: ${STUFFHUB_IMAGE_ROOT:-ghcr.io/kevincodez/stuffhub}-db:${STUFFHUB_VERSION:-latest}
     restart: unless-stopped
-    environment:
-      POSTGRES_HOST: /var/run/postgresql
-      PGPORT: 5432
-      POSTGRES_PORT: 5432
-      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      PGDATABASE: postgres
-      POSTGRES_DB: postgres
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
-      JWT_EXP: ${JWT_EXPIRY:-3600}
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/stuffhub-with-secrets"]
     command:
+      - docker-entrypoint.sh
       - postgres
       - -c
       - config_file=/etc/postgresql/postgresql.conf
       - -c
       - log_min_messages=warning
+    configs:
+      - source: secret-loader
+        target: /usr/local/bin/stuffhub-with-secrets
+        mode: 0555
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      PGDATABASE: postgres
+      POSTGRES_DB: postgres
+      JWT_EXP: ${JWT_EXPIRY:-3600}
     volumes:
-      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
-      - ./volumes/db/auth-ownership.sql:/docker-entrypoint-initdb.d/init-scripts/99-auth-ownership.sql:ro
-      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      - secrets-data:/run/stuffhub:ro
       - database-data:/var/lib/postgresql/data
       - database-config:/etc/postgresql-custom
     healthcheck:
@@ -229,7 +319,34 @@ services:
       timeout: 5s
       retries: 20
 
+configs:
+  secret-loader:
+    content: |
+      #!/bin/sh
+      set -eu
+      secret_file=/run/stuffhub/secrets.env
+      if [ ! -s "$$secret_file" ]; then
+        echo "StuffHub installation secrets are missing." >&2
+        exit 1
+      fi
+      set -a
+      . "$$secret_file"
+      set +a
+      export PGPASSWORD="$$POSTGRES_PASSWORD"
+      export SUPABASE_ANON_KEY="$$ANON_KEY"
+      export SUPABASE_SERVICE_KEY="$$SERVICE_ROLE_KEY"
+      export GOTRUE_JWT_SECRET="$$JWT_SECRET"
+      export GOTRUE_DB_DATABASE_URL="postgres://supabase_auth_admin:$$POSTGRES_PASSWORD@db:5432/postgres"
+      export PGRST_DB_URI="postgres://authenticator:$$POSTGRES_PASSWORD@db:5432/postgres"
+      export PGRST_JWT_SECRET="$$JWT_SECRET"
+      export PGRST_APP_SETTINGS_JWT_SECRET="$$JWT_SECRET"
+      export SERVICE_KEY="$$SERVICE_ROLE_KEY"
+      export AUTH_JWT_SECRET="$$JWT_SECRET"
+      export DATABASE_URL="postgres://supabase_storage_admin:$$POSTGRES_PASSWORD@db:5432/postgres"
+      exec "$$@"
+
 volumes:
+  secrets-data:
   database-data:
   database-config:
   storage-data:

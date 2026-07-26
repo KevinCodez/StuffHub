@@ -7,9 +7,9 @@ node_modules
 **/node_modules
 **/.next
 **/*.tsbuildinfo
-.env
-.env.*
-!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 coverage
 deploy/volumes/db/data
 deploy/volumes/storage

@@ -1,0 +1,6 @@
+FROM postgres:17.6-alpine
+
+COPY --chmod=0555 deploy/migrate.sh /usr/local/bin/stuffhub-migrate
+COPY deploy/migrations /migrations
+
+ENTRYPOINT ["/usr/local/bin/stuffhub-migrate"]

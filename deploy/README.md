@@ -1,56 +1,64 @@
 # StuffHub self-hosting
 
-This bundle starts the StuffHub web application and API together with its
-PostgreSQL, Auth, PostgREST, and private Storage services.
+StuffHub ships as one standalone Compose file. It starts the web application and
+API together with PostgreSQL, Auth, PostgREST, private Storage, image processing,
+and one-shot database migrations.
 
 ## Requirements
 
-- Docker Engine 24+ with Docker Compose v2
+- Docker Engine 24+ with Docker Compose v2.23.1 or newer
 - 4 GB RAM minimum; 8 GB recommended
 - 40 GB of available SSD storage
 
 ## Install
 
-Download and unpack the self-host archive attached to a StuffHub GitHub
-release, then run:
+Download the Compose file from the latest GitHub release and start it:
 
 ```bash
-cd stuffhub
-./generate-env.sh
+curl -fsSLO https://github.com/KevinCodez/StuffHub/releases/latest/download/compose.yaml
 docker compose up -d --wait
 ```
 
-Open <http://localhost:3000>. The generated `.env` uses unique database and JWT
-secrets and enables immediate email/password registration.
+Open <http://localhost:3000>. On its first run, the `bootstrap` container creates
+a unique database password, JWT secret, and Supabase API keys. They are stored
+in the `stuffhub_secrets-data` Docker volume and reused on every subsequent run.
+No `.env` file or host-side script is required.
 
-To use a locally built image from a source checkout:
+As a safety measure, bootstrap refuses to create replacement secrets when the
+secrets volume is empty but an existing PostgreSQL database is present. Restore
+`stuffhub_secrets-data` from backup if this guard is triggered; generating new
+credentials would make the application unable to authenticate to that database.
+
+## Reverse proxy and public URLs
+
+The default configuration publishes the web app on port 3000 and the Supabase
+gateway on port 8000. For Internet access, send two HTTPS hostnames through your
+reverse proxy:
+
+- `inventory.example.com` to port 3000
+- `inventory-api.example.com` to port 8000
+
+Provide the matching public URLs when starting the stack:
 
 ```bash
-docker build -t stuffhub:local ..
-./generate-env.sh
-sed -i.bak 's|^STUFFHUB_IMAGE=.*|STUFFHUB_IMAGE=stuffhub:local|' .env
+APP_URL=https://inventory.example.com \
+SUPABASE_PUBLIC_URL=https://inventory-api.example.com \
+COOKIE_SECURE=true \
 docker compose up -d --wait
 ```
 
-## Internet-facing configuration
+Docker Compose also reads these values from an optional `.env` file if keeping
+server-specific settings there is more convenient. The installation does not
+require one for local or LAN use.
 
-Before exposing StuffHub outside a trusted network:
+## Email and password recovery
 
-1. Put ports 3000 and 8000 behind a TLS reverse proxy.
-2. Set `APP_URL` to the public web origin.
-3. Set `SUPABASE_PUBLIC_URL` to the public Supabase gateway origin.
-4. Set `COOKIE_SECURE=true`.
-5. Configure SMTP, set `ENABLE_EMAIL_AUTOCONFIRM=false`, and verify recovery
-   email delivery.
-6. Restrict direct access to PostgreSQL. This Compose file does not publish the
-   database port.
-
-Example:
+New accounts are confirmed immediately by default, so SMTP is not needed for a
+basic home-server installation. Password-reset emails require SMTP. Configure
+it with Compose environment variables (or an optional `.env`) and disable
+automatic confirmation:
 
 ```dotenv
-APP_URL=https://inventory.example.com
-SUPABASE_PUBLIC_URL=https://inventory-api.example.com
-COOKIE_SECURE=true
 ENABLE_EMAIL_AUTOCONFIRM=false
 SMTP_ADMIN_EMAIL=stuffhub@example.com
 SMTP_HOST=smtp.example.com
@@ -60,30 +68,36 @@ SMTP_PASS=replace-me
 SMTP_SENDER_NAME=StuffHub
 ```
 
-The reverse proxy must send the StuffHub hostname to port 3000 and the
-Supabase hostname to port 8000.
+Restart the stack with `docker compose up -d --wait` after changing settings.
 
-## Update
+## Update and version pinning
 
-Read the release notes and back up the installation first. Then change
-`STUFFHUB_IMAGE` to the desired immutable version and run:
+Back up the installation and read the release notes, then pull and recreate:
 
 ```bash
 docker compose pull
 docker compose up -d --wait
 ```
 
-The one-shot `migrate` service applies only new migrations. An already-applied
-migration whose contents changed is rejected.
+The default `latest` tag follows the newest release. To pin or roll back all
+StuffHub images together, set a release version for the command:
 
-Using `latest` is supported, but versioned tags make rollback and incident
-diagnosis safer:
-
-```dotenv
-STUFFHUB_IMAGE=ghcr.io/OWNER/REPOSITORY:1.1.0
+```bash
+STUFFHUB_VERSION=1.0.0 docker compose up -d --wait
 ```
 
-## Back up
+The `migrate` service applies only new migrations and rejects a migration whose
+contents changed after it was applied.
+
+## Persistent data and backups
+
+`docker compose down` preserves all installation data. Four named volumes are
+used:
+
+- `stuffhub_database-data` — PostgreSQL data
+- `stuffhub_database-config` — generated PostgreSQL configuration
+- `stuffhub_storage-data` — uploaded photographs and documents
+- `stuffhub_secrets-data` — database and JWT credentials
 
 Create a database dump:
 
@@ -91,39 +105,33 @@ Create a database dump:
 docker compose exec -T db pg_dump -U postgres -d postgres -Fc > stuffhub-db.dump
 ```
 
-Back up private media:
+Back up uploaded files and installation secrets:
 
 ```bash
-docker run --rm \
-  -v stuffhub_storage-data:/source:ro \
-  -v "$PWD":/backup \
-  alpine tar -czf /backup/stuffhub-storage.tar.gz -C /source .
+docker run --rm -v stuffhub_storage-data:/source:ro -v "$PWD":/backup alpine \
+  tar -czf /backup/stuffhub-storage.tar.gz -C /source .
+docker run --rm -v stuffhub_secrets-data:/source:ro -v "$PWD":/backup alpine \
+  tar -czf /backup/stuffhub-secrets.tar.gz -C /source .
 ```
 
-The volume name begins with the Compose project name. Confirm it with
-`docker volume ls` if `stuffhub_storage-data` is not present.
+Keep the secrets archive encrypted. Losing it does not delete inventory data,
+but restoring the same secrets preserves database credentials and active login
+sessions.
 
-Keep the generated `.env` in an encrypted backup. Its JWT secret is required to
-validate existing sessions, and its database password is required for recovery.
+Never run `docker compose down --volumes` unless permanently deleting the whole
+installation is intentional.
 
-## Restore
+## Local image testing
 
-Restore into an empty installation using the same StuffHub release that created
-the backup. Start the database, restore the dump, restore media, and then start
-the complete stack:
+Build the four images from the repository and give them a shared local prefix:
 
 ```bash
-docker compose up -d db
-docker compose exec -T db pg_restore -U postgres -d postgres --clean --if-exists < stuffhub-db.dump
-docker run --rm \
-  -v stuffhub_storage-data:/target \
-  -v "$PWD":/backup:ro \
-  alpine tar -xzf /backup/stuffhub-storage.tar.gz -C /target
-docker compose up -d --wait
+docker build -t stuffhub:local .
+docker build -f deploy/Dockerfile.db -t stuffhub-db:local .
+docker build -f deploy/Dockerfile.gateway -t stuffhub-gateway:local .
+docker build -f deploy/Dockerfile.migrate -t stuffhub-migrate:local .
+STUFFHUB_IMAGE_ROOT=stuffhub STUFFHUB_VERSION=local docker compose -f deploy/compose.yaml up -d --wait
 ```
-
-Test restores periodically. A backup that has never been restored is not a
-verified backup.
 
 ## Operations
 
@@ -134,6 +142,3 @@ docker compose logs -f migrate
 docker compose stop
 docker compose down
 ```
-
-`docker compose down` preserves data. Do not add `--volumes` unless you intend
-to permanently delete the database and stored media.

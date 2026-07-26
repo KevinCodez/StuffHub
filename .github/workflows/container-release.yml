@@ -12,12 +12,8 @@ permissions:
   attestations: write
   id-token: write
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -26,70 +22,99 @@ jobs:
       - name: Verify deployment migrations are current
         run: diff -ru supabase/migrations deploy/migrations
 
+      - name: Validate Compose file
+        run: docker compose -f deploy/compose.yaml config --quiet
+
+  publish-images:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - title: StuffHub
+            dockerfile: Dockerfile
+            suffix: ""
+          - title: StuffHub database
+            dockerfile: deploy/Dockerfile.db
+            suffix: -db
+          - title: StuffHub gateway
+            dockerfile: deploy/Dockerfile.gateway
+            suffix: -gateway
+          - title: StuffHub migrations
+            dockerfile: deploy/Dockerfile.migrate
+            suffix: -migrate
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}${{ matrix.suffix }}" >> "$GITHUB_OUTPUT"
 
       - name: Derive image tags and labels
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
           labels: |
-            org.opencontainers.image.title=StuffHub
-            org.opencontainers.image.description=Self-hosted home inventory web application
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=Self-hosted StuffHub component
+            org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Build and publish image
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.dockerfile }}
 
       - name: Attest image provenance
         uses: actions/attest-build-provenance@v3
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      - name: Package self-host files
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Prepare standalone Compose file
         run: |
-          mkdir -p release/stuffhub
-          cp -R deploy/. release/stuffhub/
-          image="ghcr.io/${REPOSITORY,,}:${RELEASE_TAG#v}"
-          sed -i "s|ghcr.io/OWNER/stuffhub:1.0.0|${image}|g" release/stuffhub/.env.example release/stuffhub/generate-env.sh
-          tar -C release -czf "stuffhub-self-host-${RELEASE_TAG}.tar.gz" stuffhub
-          sha256sum "stuffhub-self-host-${RELEASE_TAG}.tar.gz" > "stuffhub-self-host-${RELEASE_TAG}.tar.gz.sha256"
+          cp deploy/compose.yaml compose.yaml
+          sha256sum compose.yaml > compose.yaml.sha256
 
       - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --generate-notes
-          gh release upload "$RELEASE_TAG" \
-            "stuffhub-self-host-${RELEASE_TAG}.tar.gz" \
-            "stuffhub-self-host-${RELEASE_TAG}.tar.gz.sha256" \
-            --clobber
+          gh release upload "$RELEASE_TAG" compose.yaml compose.yaml.sha256 --clobber

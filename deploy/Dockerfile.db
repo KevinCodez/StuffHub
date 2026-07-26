@@ -1,0 +1,5 @@
+FROM supabase/postgres:17.6.1.136
+
+COPY deploy/volumes/db/roles.sql /docker-entrypoint-initdb.d/init-scripts/99-roles.sql
+COPY deploy/volumes/db/auth-ownership.sql /docker-entrypoint-initdb.d/init-scripts/99-auth-ownership.sql
+COPY deploy/volumes/db/jwt.sql /docker-entrypoint-initdb.d/init-scripts/99-jwt.sql

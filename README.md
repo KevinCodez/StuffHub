@@ -49,28 +49,27 @@ Supabase Studio is available at <http://127.0.0.1:54323>. See [`supabase/README.
 
 ## Self-hosted web deployment
 
-StuffHub v1 is distributed as a multi-architecture web container plus a Docker
-Compose bundle. The web container includes both the Next.js frontend and its
-HTTP API. Compose also starts the required PostgreSQL, authentication,
-PostgREST, private object storage, and migration services.
-
-From a release bundle:
+StuffHub v1 is distributed as a standalone Docker Compose file. It starts the
+web application, API, PostgreSQL, authentication, PostgREST, private object
+storage, image processing, and database migrations. Unique installation secrets
+are created automatically and kept in a persistent Docker volume.
 
 ```bash
-./generate-env.sh
+curl -fsSLO https://github.com/KevinCodez/StuffHub/releases/latest/download/compose.yaml
 docker compose up -d --wait
 ```
 
-To update to the version configured in `.env`:
+Open <http://localhost:3000>. No repository checkout, `.env` file, or setup
+script is required. Updating is equally direct:
 
 ```bash
 docker compose pull
 docker compose up -d --wait
 ```
 
-See [`deploy/README.md`](deploy/README.md) for installation, HTTPS, SMTP,
-backup, restore, rollback, and local-image instructions. Container releases are
-published to GitHub Container Registry when a `v*` Git tag is pushed.
+See [`deploy/README.md`](deploy/README.md) for HTTPS, SMTP, backups, restores,
+version pinning, and local-image testing. Multi-architecture container releases
+are published to GitHub Container Registry when a `v*` Git tag is pushed.
 
 ## Architecture direction
 
